@@ -1,5 +1,6 @@
 export type GameRecord = {
   name: string;
+  aliases?: string[];
   category: string;
   publisher: string;
   operator: string;
@@ -7,6 +8,9 @@ export type GameRecord = {
   isbn: string;
   approvalDate: string;
   sourceType: '国产' | '进口';
+  sourceUrl?: string;
+  changeDate?: string;
+  changeInfo?: string;
 };
 
 // 用于演示查询能力。正式使用时可在页面中导入官方公示整理后的 JSON / CSV。
@@ -163,4 +167,4 @@ export const demoGames: GameRecord[] = [
   },
 ];
 
-export const demoQueries = ['山海旅程', '星河小镇', '萌宠乐园'];
+export const demoQueries = ['足球梦剧场', '布谷岛', '龙族征战'];

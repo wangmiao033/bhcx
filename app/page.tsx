@@ -41,7 +41,7 @@ const KNOWN_WORDS = [
 ];
 
 type SearchResult = {
-  exact: GameRecord[];
+  exact: Array<GameRecord & { aliasMatch: boolean }>;
   similar: Array<GameRecord & { similarity: number }>;
   keywords: KeywordResult[];
 };
@@ -77,6 +77,10 @@ declare global {
 
 function normalizeName(value: string) {
   return value.replace(/[《》·\s:：—_-]/g, '').toLowerCase();
+}
+
+function recordNames(record: GameRecord) {
+  return [record.name, ...(record.aliases ?? [])];
 }
 
 function bigrams(value: string) {
@@ -126,7 +130,7 @@ function splitKeywords(query: string, records: GameRecord[]) {
 
 function buildKeyword(word: string, records: GameRecord[], referenceDate: Date): KeywordResult {
   const matches = records
-    .filter((record) => normalizeName(record.name).includes(normalizeName(word)))
+    .filter((record) => recordNames(record).some((name) => normalizeName(name).includes(normalizeName(word))))
     .sort((a, b) => b.approvalDate.localeCompare(a.approvalDate));
   const yearCounts = matches.reduce<Record<string, number>>((counts, record) => {
     const year = record.approvalDate.slice(0, 4);
@@ -145,10 +149,12 @@ function buildKeyword(word: string, records: GameRecord[], referenceDate: Date):
 
 function analyze(query: string, records: GameRecord[]): SearchResult {
   const normalized = normalizeName(query);
-  const exact = records.filter((record) => normalizeName(record.name) === normalized);
+  const exact = records
+    .filter((record) => recordNames(record).some((name) => normalizeName(name) === normalized))
+    .map((record) => ({ ...record, aliasMatch: normalizeName(record.name) !== normalized }));
   const similar = records
-    .filter((record) => normalizeName(record.name) !== normalized)
-    .map((record) => ({ ...record, similarity: similarity(query, record.name) }))
+    .filter((record) => !recordNames(record).some((name) => normalizeName(name) === normalized))
+    .map((record) => ({ ...record, similarity: Math.max(...recordNames(record).map((name) => similarity(query, name))) }))
     .filter((record) => record.similarity >= 0.22)
     .sort((a, b) => b.similarity - a.similarity || b.approvalDate.localeCompare(a.approvalDate))
     .slice(0, 6);
@@ -196,6 +202,7 @@ function normalizeImportedRecord(input: Record<string, unknown>): GameRecord | n
   if (!name || !approvalDate) return null;
   return {
     name,
+    aliases: Array.isArray(input.aliases) ? input.aliases.filter((item): item is string => typeof item === 'string') : [],
     category: value(['category', '申报类别', '游戏类别']) ?? '—',
     publisher: value(['publisher', '出版单位']) ?? '—',
     operator: value(['operator', '运营单位']) ?? '—',
@@ -203,10 +210,13 @@ function normalizeImportedRecord(input: Record<string, unknown>): GameRecord | n
     isbn: value(['isbn', '出版物号']) ?? '—',
     approvalDate,
     sourceType: value(['sourceType', '来源', '类型']) === '进口' ? '进口' : '国产',
+    sourceUrl: value(['sourceUrl', '来源链接']),
+    changeDate: value(['changeDate', '变更日期']),
+    changeInfo: value(['changeInfo', '变更信息']),
   };
 }
 
-function RecordCard({ record, score }: { record: GameRecord; score?: number }) {
+function RecordCard({ record, score, aliasMatch }: { record: GameRecord; score?: number; aliasMatch?: boolean }) {
   return (
     <article className="rounded-2xl border border-stone-200 bg-white p-5 transition hover:-translate-y-0.5 hover:border-emerald-800/30 hover:shadow-[0_12px_34px_rgb(36_55_44/8%)]">
       <div className="mb-4 flex items-start justify-between gap-3">
@@ -214,7 +224,9 @@ function RecordCard({ record, score }: { record: GameRecord; score?: number }) {
           <h4 className="text-lg font-semibold tracking-tight text-stone-950">《{record.name}》</h4>
           <p className="mt-1 text-xs text-stone-500">{record.documentNumber}</p>
         </div>
-        {score !== undefined ? (
+        {aliasMatch ? (
+          <Badge className="bg-amber-100 text-amber-800">历史名称命中</Badge>
+        ) : score !== undefined ? (
           <Badge className="bg-emerald-50 text-emerald-800">相似 {Math.round(score * 100)}%</Badge>
         ) : (
           <Badge className="bg-emerald-900 text-white">完全同名</Badge>
@@ -225,6 +237,8 @@ function RecordCard({ record, score }: { record: GameRecord; score?: number }) {
         <p className="flex gap-2"><Building2 className="mt-0.5 size-4 shrink-0 text-stone-400" /><span><b className="font-medium text-stone-800">出版：</b>{record.publisher}</span></p>
         <p className="flex gap-2"><Gamepad2 className="mt-0.5 size-4 shrink-0 text-stone-400" /><span><b className="font-medium text-stone-800">运营：</b>{record.operator}</span></p>
         <p className="flex gap-2"><FileText className="mt-0.5 size-4 shrink-0 text-stone-400" />{record.isbn}</p>
+        {!!record.aliases?.length && <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">历史名称：{record.aliases.join('、')}</p>}
+        {record.changeInfo && <p className="text-xs leading-5 text-stone-500">最近变更：{record.changeInfo}</p>}
       </div>
     </article>
   );
@@ -285,15 +299,8 @@ function KeywordCard({ item }: { item: KeywordResult }) {
 }
 
 export default function Home() {
-  const [records, setRecords] = useState<GameRecord[]>(() => {
-    if (typeof window === 'undefined') return demoGames;
-    try {
-      const saved = window.localStorage.getItem(STORAGE_KEY);
-      return saved ? (JSON.parse(saved) as GameRecord[]) : demoGames;
-    } catch {
-      return demoGames;
-    }
-  });
+  const [records, setRecords] = useState<GameRecord[]>(demoGames);
+  const [dataSource, setDataSource] = useState<'loading' | 'official' | 'local' | 'demo'>('loading');
   const [input, setInput] = useState('山海旅程');
   const [query, setQuery] = useState('山海旅程');
   const [notice, setNotice] = useState('');
@@ -301,6 +308,30 @@ export default function Home() {
   const result = useMemo(() => analyze(query, records), [query, records]);
   const latestDate = useMemo(() => records.reduce((latest, record) => record.approvalDate > latest ? record.approvalDate : latest, '—'), [records]);
   const uniqueNames = useMemo(() => new Set(records.map((record) => normalizeName(record.name))).size, [records]);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        setRecords(JSON.parse(saved) as GameRecord[]);
+        setDataSource('local');
+        return;
+      }
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
+    fetch('/nppa-games.json')
+      .then((response) => {
+        if (!response.ok) throw new Error('missing');
+        return response.json() as Promise<{ records?: GameRecord[] }>;
+      })
+      .then((payload) => {
+        if (!payload.records?.length) throw new Error('empty');
+        setRecords(payload.records);
+        setDataSource('official');
+      })
+      .catch(() => setDataSource('demo'));
+  }, []);
 
   useEffect(() => {
     const context = document.modelContext;
@@ -365,12 +396,17 @@ export default function Home() {
     if (!file) return;
     try {
       const text = await file.text();
+      const jsonValue = file.name.toLowerCase().endsWith('.csv') ? null : JSON.parse(text) as unknown;
+      const jsonRows = Array.isArray(jsonValue)
+        ? jsonValue
+        : ((jsonValue as { records?: unknown[] } | null)?.records ?? []);
       const parsed = file.name.toLowerCase().endsWith('.csv')
         ? parseCsv(text)
-        : (JSON.parse(text) as unknown[]).map((item) => normalizeImportedRecord(item as Record<string, unknown>)).filter(Boolean) as GameRecord[];
+        : jsonRows.map((item) => normalizeImportedRecord(item as Record<string, unknown>)).filter(Boolean) as GameRecord[];
       if (!parsed.length) throw new Error('empty');
       const deduped = [...new Map(parsed.map((record) => [`${record.documentNumber}-${normalizeName(record.name)}`, record])).values()];
       setRecords(deduped);
+      setDataSource('local');
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(deduped));
       setNotice(`已导入 ${deduped.length.toLocaleString('zh-CN')} 条记录，数据仅保存在当前浏览器。`);
     } catch {
@@ -380,10 +416,20 @@ export default function Home() {
     }
   }
 
-  function resetData() {
-    setRecords(demoGames);
+  async function resetData() {
     window.localStorage.removeItem(STORAGE_KEY);
-    setNotice('已恢复演示数据。');
+    try {
+      const response = await fetch('/nppa-games.json');
+      const payload = await response.json() as { records?: GameRecord[] };
+      if (!payload.records?.length) throw new Error('empty');
+      setRecords(payload.records);
+      setDataSource('official');
+      setNotice('已恢复内置的官方公示数据。');
+    } catch {
+      setRecords(demoGames);
+      setDataSource('demo');
+      setNotice('未找到公示数据文件，已恢复演示数据。');
+    }
   }
 
   return (
@@ -447,7 +493,7 @@ export default function Home() {
               </div>
               <div className="mt-8 border-t border-stone-200 pt-4 text-xs leading-6 text-stone-500">
                 <p className="flex items-center justify-between"><span>最新批准时间</span><b className="font-medium text-stone-700">{latestDate}</b></p>
-                <p className="mt-1 flex items-center justify-between"><span>数据状态</span><span className="flex items-center gap-1 text-amber-700"><span className="size-1.5 rounded-full bg-amber-500" />演示 / 本地数据</span></p>
+                <p className="mt-1 flex items-center justify-between"><span>数据状态</span><span className={`flex items-center gap-1 ${dataSource === 'official' ? 'text-emerald-700' : 'text-amber-700'}`}><span className={`size-1.5 rounded-full ${dataSource === 'official' ? 'bg-emerald-500' : 'bg-amber-500'}`} />{dataSource === 'loading' ? '正在载入' : dataSource === 'official' ? '官方公示数据' : dataSource === 'local' ? '本地导入数据' : '演示数据'}</span></p>
               </div>
             </CardContent>
           </Card>
@@ -477,7 +523,7 @@ export default function Home() {
                   </div>
                 )}
                 <div className="grid gap-4 xl:grid-cols-2">
-                  {result.exact.map((record) => <RecordCard key={`${record.documentNumber}-${record.name}`} record={record} />)}
+                  {result.exact.map((record) => <RecordCard key={`${record.documentNumber}-${record.name}`} record={record} aliasMatch={record.aliasMatch} />)}
                   {result.similar.map((record) => <RecordCard key={`${record.documentNumber}-${record.name}`} record={record} score={record.similarity} />)}
                 </div>
                 {!result.exact.length && !result.similar.length && (
@@ -499,7 +545,7 @@ export default function Home() {
 
         <footer className="mt-12 border-t border-stone-200 py-7 text-xs leading-6 text-stone-500">
           <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
-            <div><p className="font-medium text-stone-700">数据说明与免责声明</p><p className="mt-1 max-w-3xl">当前内置内容仅为功能演示。正式数据应来自国家新闻出版署公开的网络游戏审批信息；查询结果仅供名称初筛与个人研究，不构成专业意见、审批预测或权利判断。</p></div>
+            <div><p className="font-medium text-stone-700">数据说明与免责声明</p><p className="mt-1 max-w-3xl">内置数据来自国家新闻出版署公开的网络游戏审批信息，并合并可匹配的审批变更记录；查询结果仅供名称初筛与个人研究，不构成专业意见、审批预测或权利判断。</p></div>
             <a href="https://www.nppa.gov.cn/bsfw/jggs/yxspjg/gcwlyxspxx/index.html" target="_blank" rel="noreferrer" className="flex shrink-0 items-center gap-1.5 font-medium text-emerald-900 hover:underline">国家新闻出版署 <ArrowUpRight className="size-3.5" /></a>
           </div>
         </footer>
