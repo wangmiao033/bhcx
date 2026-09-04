@@ -178,6 +178,7 @@ function parseCsv(text: string): GameRecord[] {
     documentNumber: ['documentNumber', '批复文号', '文号'],
     isbn: ['isbn', '出版物号'],
     approvalDate: ['approvalDate', '批准时间', '审批日期'],
+    recordDate: ['recordDate', '官方记录时间', '记录日期'],
     sourceType: ['sourceType', '来源', '类型'],
   };
   const indexOf = (key: keyof GameRecord) =>
@@ -191,7 +192,10 @@ function parseCsv(text: string): GameRecord[] {
       documentNumber: row[indexOf('documentNumber')] ?? '—',
       isbn: row[indexOf('isbn')] ?? '—',
       approvalDate: row[indexOf('approvalDate')] ?? '',
-      sourceType: (row[indexOf('sourceType')] === '进口' ? '进口' : '国产') as '国产' | '进口',
+      recordDate: row[indexOf('recordDate')] || undefined,
+      sourceType: (['国产', '进口'].includes(row[indexOf('sourceType')])
+        ? row[indexOf('sourceType')]
+        : '未标明') as GameRecord['sourceType'],
     }))
     .filter((record) => record.name && /^\d{4}-\d{2}-\d{2}$/.test(record.approvalDate));
 }
@@ -200,6 +204,7 @@ function normalizeImportedRecord(input: Record<string, unknown>): GameRecord | n
   const value = (keys: string[]) => keys.map((key) => input[key]).find((item) => typeof item === 'string') as string | undefined;
   const name = value(['name', '游戏名称', '名称']);
   const approvalDate = value(['approvalDate', '批准时间', '审批日期']);
+  const sourceType = value(['sourceType', '来源', '类型']);
   if (!name || !approvalDate) return null;
   return {
     name,
@@ -210,14 +215,18 @@ function normalizeImportedRecord(input: Record<string, unknown>): GameRecord | n
     documentNumber: value(['documentNumber', '批复文号', '文号']) ?? '—',
     isbn: value(['isbn', '出版物号']) ?? '—',
     approvalDate,
-    sourceType: value(['sourceType', '来源', '类型']) === '进口' ? '进口' : '国产',
+    recordDate: value(['recordDate', '官方记录时间', '记录日期']),
+    sourceType: sourceType === '国产' || sourceType === '进口' ? sourceType : '未标明',
     sourceUrl: value(['sourceUrl', '来源链接']),
+    archiveSourceUrl: value(['archiveSourceUrl', '历史公示链接']),
     changeDate: value(['changeDate', '变更日期']),
     changeInfo: value(['changeInfo', '变更信息']),
   };
 }
 
 function RecordCard({ record, score, aliasMatch }: { record: GameRecord; score?: number; aliasMatch?: boolean }) {
+  const recordDate = record.recordDate ?? record.changeDate ?? record.approvalDate;
+  const recordFacts = [record.sourceType !== '未标明' ? record.sourceType : '', record.category !== '—' ? record.category : ''].filter(Boolean);
   return (
     <article className="rounded-2xl border border-stone-200 bg-white p-5 transition hover:-translate-y-0.5 hover:border-emerald-800/30 hover:shadow-[0_12px_34px_rgb(36_55_44/8%)]">
       <div className="mb-4 flex items-start justify-between gap-3">
@@ -234,12 +243,14 @@ function RecordCard({ record, score, aliasMatch }: { record: GameRecord; score?:
         )}
       </div>
       <div className="grid gap-2.5 text-sm text-stone-600">
-        <p className="flex gap-2"><CalendarDays className="mt-0.5 size-4 shrink-0 text-stone-400" />{record.approvalDate} · {record.sourceType} · {record.category}</p>
+        <p className="flex gap-2"><CalendarDays className="mt-0.5 size-4 shrink-0 text-stone-400" /><span><b className="font-medium text-stone-800">官方记录：</b>{recordDate}{recordFacts.length ? ` · ${recordFacts.join(' · ')}` : ''}</span></p>
+        {recordDate !== record.approvalDate && <p className="pl-6 text-xs text-stone-500">首次批准：{record.approvalDate}</p>}
         <p className="flex gap-2"><Building2 className="mt-0.5 size-4 shrink-0 text-stone-400" /><span><b className="font-medium text-stone-800">出版：</b>{record.publisher}</span></p>
         <p className="flex gap-2"><Gamepad2 className="mt-0.5 size-4 shrink-0 text-stone-400" /><span><b className="font-medium text-stone-800">运营：</b>{record.operator}</span></p>
-        <p className="flex gap-2"><FileText className="mt-0.5 size-4 shrink-0 text-stone-400" />{record.isbn}</p>
+        <p className="flex gap-2"><FileText className="mt-0.5 size-4 shrink-0 text-stone-400" />{record.isbn === '—' ? '出版物号未公开' : record.isbn}</p>
         {!!record.aliases?.length && <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">历史名称：{record.aliases.join('、')}</p>}
         {record.changeInfo && <p className="text-xs leading-5 text-stone-500">最近变更：{record.changeInfo}</p>}
+        {record.sourceUrl && <a className="w-fit text-xs font-medium text-emerald-800 underline decoration-emerald-800/30 underline-offset-4 hover:text-emerald-950" href={record.sourceUrl} target="_blank" rel="noreferrer">查看国家新闻出版署记录 ↗</a>}
       </div>
     </article>
   );
@@ -307,7 +318,10 @@ export default function Home() {
   const [notice, setNotice] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
   const result = useMemo(() => analyze(query, records), [query, records]);
-  const latestDate = useMemo(() => records.reduce((latest, record) => record.approvalDate > latest ? record.approvalDate : latest, '—'), [records]);
+  const latestDate = useMemo(() => records.reduce((latest, record) => {
+    const date = record.recordDate ?? record.approvalDate;
+    return date > latest ? date : latest;
+  }, '—'), [records]);
   const uniqueNames = useMemo(() => new Set(records.map((record) => normalizeName(record.name))).size, [records]);
 
   useEffect(() => {
@@ -493,7 +507,7 @@ export default function Home() {
                 <p className="mt-1 text-sm text-stone-500">条版号记录 · {uniqueNames.toLocaleString('zh-CN')} 个名称</p>
               </div>
               <div className="mt-8 border-t border-stone-200 pt-4 text-xs leading-6 text-stone-500">
-                <p className="flex items-center justify-between"><span>最新批准时间</span><b className="font-medium text-stone-700">{latestDate}</b></p>
+                <p className="flex items-center justify-between"><span>最新官方记录</span><b className="font-medium text-stone-700">{latestDate}</b></p>
                 <p className="mt-1 flex items-center justify-between"><span>数据状态</span><span className={`flex items-center gap-1 ${dataSource === 'official' ? 'text-emerald-700' : 'text-amber-700'}`}><span className={`size-1.5 rounded-full ${dataSource === 'official' ? 'bg-emerald-500' : 'bg-amber-500'}`} />{dataSource === 'loading' ? '正在载入' : dataSource === 'official' ? '官方公示数据' : dataSource === 'local' ? '本地导入数据' : '演示数据'}</span></p>
               </div>
             </CardContent>

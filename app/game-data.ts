@@ -7,8 +7,10 @@ export type GameRecord = {
   documentNumber: string;
   isbn: string;
   approvalDate: string;
-  sourceType: '国产' | '进口';
+  recordDate?: string;
+  sourceType: '国产' | '进口' | '未标明';
   sourceUrl?: string;
+  archiveSourceUrl?: string;
   changeDate?: string;
   changeInfo?: string;
 };

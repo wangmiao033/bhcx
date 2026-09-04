@@ -24,7 +24,10 @@ SOURCES = {
     "国产": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/gcwlyxspxx/index.html",
     "进口": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/jkwlyxspxx/index.html",
     "变更": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/yxspbgxx/index.html",
+    "查询库": "https://www.nppa.gov.cn/bsfw/jggs/cxjg/index.html",
 }
+
+SEARCH_API_URL = "https://www.nppa.gov.cn/was5/web/search?channelid=288556"
 
 MASTER_APPROVAL_PATTERN = re.compile(
     r"(20\d{2})年.*?(国产网络游戏|进口网络游戏|进口电子游戏)审批信息"
@@ -42,12 +45,31 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", "", value.replace("\xa0", " ").strip())
 
 
+def normalize_isbn(value: str) -> str:
+    compact = clean_text(value)
+    if not compact:
+        return "—"
+    if compact[:4].lower() == "isbn" and len(compact) > 4:
+        return f"ISBN {compact[4:]}"
+    return compact
+
+
 def clean_company(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("\xa0", " ").strip()) or "—"
 
 
 def normalize_document_number(value: str) -> str:
-    return re.sub(r"\s+", "", value).replace("﹝", "〔").replace("﹞", "〕")
+    bracket_map = str.maketrans(
+        {
+            "[": "〔",
+            "]": "〕",
+            "﹝": "〔",
+            "﹞": "〕",
+            "【": "〔",
+            "】": "〕",
+        }
+    )
+    return re.sub(r"\s+", "", value).translate(bracket_map)
 
 
 def normalize_date(value: str) -> str:
@@ -103,6 +125,45 @@ class PoliteClient:
                 if attempt < 2:
                     time.sleep(2 ** (attempt + 1))
         raise RuntimeError(f"请求失败：{url} ({last_error})")
+
+    def post_search(self, page: int, size: int = 100) -> dict[str, Any]:
+        elapsed = time.monotonic() - self.last_request_at
+        if self.last_request_at and elapsed < self.interval:
+            time.sleep(self.interval - elapsed)
+
+        payload = {
+            "page": page,
+            "size": size,
+            "mc": "",
+            "cbdw": "",
+            "yydw": "",
+            "description": "",
+        }
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self.session.post(
+                    SEARCH_API_URL,
+                    data=payload,
+                    headers={"Referer": SOURCES["查询库"]},
+                    timeout=45,
+                )
+                self.last_request_at = time.monotonic()
+                response.raise_for_status()
+                raw = response.content.decode("utf-8-sig", errors="replace")
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start < 0 or end < start:
+                    raise ValueError("响应中未找到 JSON")
+                result = json.loads(raw[start : end + 1])
+                if not isinstance(result.get("data"), list):
+                    raise ValueError("响应缺少 data 列表")
+                return result
+            except (requests.RequestException, OSError, ValueError, json.JSONDecodeError) as error:
+                last_error = error
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+        raise RuntimeError(f"查询库第 {page} 页请求失败：{last_error}")
 
 
 def page_count(soup: BeautifulSoup) -> int:
@@ -242,7 +303,7 @@ def parse_approval_page(soup: BeautifulSoup, link: DetailLink) -> list[dict[str,
                 "publisher": publisher,
                 "operator": operator,
                 "documentNumber": normalize_document_number(document_number),
-                "isbn": clean_text(isbn),
+                "isbn": normalize_isbn(isbn),
                 "approvalDate": date,
                 "sourceType": link.source_type,
                 "sourceUrl": link.url,
@@ -280,6 +341,149 @@ def parse_change_page(soup: BeautifulSoup, link: DetailLink) -> list[dict[str, A
             }
         )
     return changes
+
+
+def parse_search_record(item: dict[str, Any]) -> dict[str, Any] | None:
+    """把官网“查询结果库”的当前记录转换为站点字段。"""
+    name = clean_company(str(item.get("mc", "")))
+    record_date = normalize_date(str(item.get("sj", "")))
+    if name == "—" or not record_date:
+        return None
+
+    source_url = str(item.get("docpuburl", "")).strip()
+    return {
+        "name": name,
+        "aliases": [],
+        "category": "—",
+        "publisher": clean_company(str(item.get("cbdw", ""))),
+        "operator": clean_company(str(item.get("yydw", ""))),
+        "documentNumber": normalize_document_number(str(item.get("wh", ""))) or "—",
+        "isbn": normalize_isbn(str(item.get("cbwh", ""))),
+        # 未匹配到历史公示时，以官网当前记录日期作为可用的批准日期。
+        "approvalDate": record_date,
+        "recordDate": record_date,
+        "sourceType": "未标明",
+        "sourceUrl": source_url or SOURCES["查询库"],
+    }
+
+
+def fetch_search_database(client: PoliteClient, page_size: int = 100) -> tuple[list[dict[str, Any]], int]:
+    """低频分页抓取官网当前查询结果库。"""
+    first = client.post_search(1, page_size)
+    total = int(first.get("total", 0))
+    pages = max(1, (total + page_size - 1) // page_size)
+    records: list[dict[str, Any]] = []
+
+    for page in range(1, pages + 1):
+        result = first if page == 1 else client.post_search(page, page_size)
+        expected_count = page_size if page < pages else total - page_size * (pages - 1)
+        for retry in range(3):
+            if len(result.get("data", [])) == expected_count:
+                break
+            print(
+                f"[查询库 {page}/{pages}] 本页仅返回 {len(result.get('data', []))}/"
+                f"{expected_count} 条，正在重试 {retry + 1}/3…",
+                flush=True,
+            )
+            result = client.post_search(page, page_size)
+        if len(result.get("data", [])) != expected_count:
+            raise RuntimeError(
+                f"查询库第 {page} 页数量异常：应有 {expected_count} 条，"
+                f"实际 {len(result.get('data', []))} 条"
+            )
+        page_records = [
+            record
+            for item in result.get("data", [])
+            if isinstance(item, dict)
+            for record in [parse_search_record(item)]
+            if record is not None
+        ]
+        records.extend(page_records)
+        if page == 1 or page % 10 == 0 or page == pages:
+            print(
+                f"[查询库 {page}/{pages}] 已读取 {len(records):,}/{total:,} 条",
+                flush=True,
+            )
+    return records, total
+
+
+def usable_value(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and value.strip() != "—"
+
+
+def merge_search_database(
+    current_records: list[dict[str, Any]], historical_records: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int, int]:
+    """以当前查询库为主，并从月度归档补回首次批准、类别和变更前信息。"""
+    history_by_document: dict[str, dict[str, Any]] = {}
+    history_by_isbn: dict[str, dict[str, Any]] = {}
+    for record in historical_records:
+        document = normalize_document_number(str(record.get("documentNumber", "")))
+        isbn = normalize_isbn(str(record.get("isbn", "")))
+        if document and document != "—":
+            history_by_document[document] = record
+        if isbn and isbn != "—":
+            history_by_isbn[isbn] = record
+
+    merged: list[dict[str, Any]] = []
+    matched_count = 0
+    synthesized_change_count = 0
+    for current in current_records:
+        document = normalize_document_number(str(current.get("documentNumber", "")))
+        isbn = normalize_isbn(str(current.get("isbn", "")))
+        historical = history_by_document.get(document)
+        if historical is None and isbn and isbn != "—":
+            historical = history_by_isbn.get(isbn)
+
+        if historical is None:
+            merged.append(current)
+            continue
+
+        matched_count += 1
+        record = dict(current)
+        record["approvalDate"] = historical.get("approvalDate") or current["recordDate"]
+        record["sourceType"] = historical.get("sourceType") or "未标明"
+        record["category"] = historical.get("category") or "—"
+        record["aliases"] = list(historical.get("aliases") or [])
+
+        archive_url = historical.get("archiveSourceUrl") or historical.get("sourceUrl")
+        if usable_value(archive_url) and archive_url != record.get("sourceUrl"):
+            record["archiveSourceUrl"] = archive_url
+
+        differences: list[str] = []
+        comparison_fields = (
+            ("name", "原游戏名称"),
+            ("publisher", "原出版单位"),
+            ("operator", "原运营单位"),
+        )
+        for field, label in comparison_fields:
+            old_value = historical.get(field)
+            new_value = record.get(field)
+            if usable_value(old_value) and usable_value(new_value) and old_value != new_value:
+                differences.append(f"{label}（{old_value}）")
+                if field == "name":
+                    record["aliases"] = list(
+                        dict.fromkeys([*record["aliases"], str(old_value)])
+                    )
+
+        if differences:
+            record["changeInfo"] = "；".join(differences)
+            record["changeDate"] = record["recordDate"]
+            synthesized_change_count += 1
+        else:
+            for field in ("changeInfo", "changeDate", "changeSourceUrl"):
+                if historical.get(field):
+                    record[field] = historical[field]
+
+        record["aliases"] = [
+            alias
+            for alias in dict.fromkeys(record["aliases"])
+            if normalize_name(alias) != normalize_name(record["name"])
+        ]
+        merged.append(record)
+
+    # 官网 total 统计的是公开结果行数；即使文号重复也保留，确保数据量一致。
+    return merged, matched_count, synthesized_change_count
 
 
 def deduplicate(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -344,10 +548,13 @@ def write_csv(path: Path, records: list[dict[str, Any]]) -> None:
         "documentNumber",
         "isbn",
         "approvalDate",
+        "recordDate",
         "sourceType",
         "changeDate",
         "changeInfo",
         "sourceUrl",
+        "archiveSourceUrl",
+        "changeSourceUrl",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
@@ -422,6 +629,45 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def build_search_dataset(
+    args: argparse.Namespace, historical_payload: dict[str, Any]
+) -> dict[str, Any]:
+    """构建官网当前全量查询库，并用已有月度归档补充历史字段。"""
+    client = PoliteClient(args.interval)
+    print("[查询库] 正在读取国家新闻出版署当前全量结果…", flush=True)
+    current_records, official_total = fetch_search_database(client)
+    historical_records = historical_payload.get("records", [])
+    records, matched_count, synthesized_change_count = merge_search_database(
+        current_records, historical_records
+    )
+    records.sort(
+        key=lambda item: (item.get("recordDate") or item["approvalDate"], item["name"]),
+        reverse=True,
+    )
+    newest_date = max(
+        (record.get("recordDate") or record["approvalDate"] for record in records),
+        default="",
+    )
+    old_metadata = historical_payload.get("metadata", {})
+    return {
+        "metadata": {
+            "source": "国家新闻出版署游戏审批结果查询库",
+            "startYear": args.start_year,
+            "fetchedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "updatedThrough": newest_date,
+            "recordCount": len(records),
+            "officialSearchTotal": official_total,
+            "historicalRecordCount": len(historical_records),
+            "matchedHistoricalCount": matched_count,
+            "synthesizedChangeCount": synthesized_change_count,
+            "changeEntryCount": old_metadata.get("changeEntryCount", 0),
+            "mergedChangeCount": old_metadata.get("mergedChangeCount", 0),
+            "sources": SOURCES,
+        },
+        "records": records,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抓取国家新闻出版署网游审批公示并生成 JSON / CSV")
     parser.add_argument("--start-year", type=int, default=2009, help="最早抓取年份，默认 2009")
@@ -430,6 +676,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv-output", type=Path, default=Path("data/nppa-games.csv"), help="CSV 输出路径")
     parser.add_argument("--skip-changes", action="store_true", help="不合并审批变更信息")
     parser.add_argument("--changes-only", action="store_true", help="只抓取变更并合并到已有 JSON 数据")
+    parser.add_argument(
+        "--search-only",
+        action="store_true",
+        help="只刷新官网当前查询库，并用已有 JSON 补充历史字段",
+    )
     return parser.parse_args()
 
 
@@ -438,7 +689,16 @@ def main() -> int:
     if args.start_year < 2000 or args.start_year > datetime.now().year + 1:
         print("start-year 不在合理范围内", file=sys.stderr)
         return 2
-    if args.changes_only:
+    if args.changes_only and args.search_only:
+        print("changes-only 与 search-only 不能同时使用", file=sys.stderr)
+        return 2
+    if args.search_only:
+        if not args.output.exists():
+            print(f"找不到用于补充历史字段的已有数据文件：{args.output}", file=sys.stderr)
+            return 2
+        historical_payload = json.loads(args.output.read_text(encoding="utf-8"))
+        payload = build_search_dataset(args, historical_payload)
+    elif args.changes_only:
         if not args.output.exists():
             print(f"找不到已有数据文件：{args.output}", file=sys.stderr)
             return 2
@@ -467,12 +727,14 @@ def main() -> int:
             }
         )
     else:
-        payload = build_dataset(args)
+        historical_payload = build_dataset(args)
+        payload = build_search_dataset(args, historical_payload)
     write_json(args.output, payload)
     write_csv(args.csv_output, payload["records"])
     metadata = payload["metadata"]
     print(
-        f"[完成] {metadata['recordCount']} 条审批记录，合并 {metadata['mergedChangeCount']} 条变更；"
+        f"[完成] {metadata['recordCount']} 条审批记录，匹配历史 "
+        f"{metadata.get('matchedHistoricalCount', 0)} 条；"
         f"最新日期 {metadata['updatedThrough']}",
         flush=True,
     )
