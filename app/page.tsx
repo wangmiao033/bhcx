@@ -170,7 +170,7 @@ function analyze(query: string, records: GameRecord[]): SearchResult {
 function parseCsv(text: string): GameRecord[] {
   const rows = text.trim().split(/\r?\n/).map((line) => line.split(',').map((cell) => cell.trim().replace(/^"|"$/g, '')));
   const headers = rows.shift() ?? [];
-  const aliases: Record<keyof GameRecord, string[]> = {
+  const aliases: Partial<Record<keyof GameRecord, string[]>> = {
     name: ['name', '游戏名称', '名称'],
     category: ['category', '申报类别', '游戏类别'],
     publisher: ['publisher', '出版单位'],
@@ -180,7 +180,8 @@ function parseCsv(text: string): GameRecord[] {
     approvalDate: ['approvalDate', '批准时间', '审批日期'],
     sourceType: ['sourceType', '来源', '类型'],
   };
-  const indexOf = (key: keyof GameRecord) => headers.findIndex((header) => aliases[key].includes(header));
+  const indexOf = (key: keyof GameRecord) =>
+    headers.findIndex((header) => (aliases[key] ?? []).includes(header));
   return rows
     .map((row) => ({
       name: row[indexOf('name')] ?? '',
