@@ -20,10 +20,16 @@ from bs4 import BeautifulSoup
 
 
 SOURCES = {
+    "总目录": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/index.html",
     "国产": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/gcwlyxspxx/index.html",
     "进口": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/jkwlyxspxx/index.html",
     "变更": "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/yxspbgxx/index.html",
 }
+
+MASTER_APPROVAL_PATTERN = re.compile(
+    r"(20\d{2})年.*?(国产网络游戏|进口网络游戏|进口电子游戏)审批信息"
+)
+MASTER_CHANGE_PATTERN = re.compile(r"(20\d{2})年.*?游戏审批变更信息")
 
 DETAIL_TITLE_PATTERNS = {
     "国产": re.compile(r"(20\d{2})年.*国产网络游戏审批信息"),
@@ -111,6 +117,58 @@ def list_page_url(index_url: str, page: int) -> str:
     return index_url.rsplit("/", 1)[0] + f"/index_{page}.html"
 
 
+def listing_candidates(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    candidates = [
+        (anchor.get_text(" ", strip=True), anchor.get("href", ""))
+        for anchor in soup.select("a[href]")
+    ]
+    # 部分目录把链接写在 document.write / JavaScript 字符串中。
+    candidates.extend(
+        (title, href)
+        for href, title in re.findall(
+            r'<a\s+href="([^"]+\.html)"[^>]*>\s*([^<]+?)\s*</a>',
+            str(soup),
+            flags=re.IGNORECASE,
+        )
+    )
+    return list(dict.fromkeys((clean_company(title), href) for title, href in candidates))
+
+
+def discover_all_details(
+    client: PoliteClient, start_year: int
+) -> tuple[list[DetailLink], list[DetailLink]]:
+    """从游戏审批结果总目录发现国产、进口、进口电子游戏和变更详情页。"""
+    index_url = SOURCES["总目录"]
+    first_soup = client.get_soup(index_url)
+    count = page_count(first_soup)
+    approvals: dict[str, DetailLink] = {}
+    changes: dict[str, DetailLink] = {}
+
+    for page in range(count):
+        soup = first_soup if page == 0 else client.get_soup(list_page_url(index_url, page))
+        for title, href in listing_candidates(soup):
+            approval_match = MASTER_APPROVAL_PATTERN.search(title)
+            change_match = MASTER_CHANGE_PATTERN.search(title)
+            if not approval_match and not change_match:
+                continue
+            year = int((approval_match or change_match).group(1))
+            if year < start_year:
+                continue
+            url = urljoin(index_url, href)
+            if not re.search(r"/t\d+_\d+\.html$", url):
+                continue
+            if approval_match:
+                source_type = "国产" if "国产网络游戏" in approval_match.group(2) else "进口"
+                approvals[url] = DetailLink(source_type, year, title, url)
+            else:
+                changes[url] = DetailLink("变更", year, title, url)
+
+    return (
+        sorted(approvals.values(), key=lambda item: (item.year, item.url), reverse=True),
+        sorted(changes.values(), key=lambda item: (item.year, item.url), reverse=True),
+    )
+
+
 def discover_details(client: PoliteClient, source_type: str, start_year: int) -> list[DetailLink]:
     index_url = SOURCES[source_type]
     first_soup = client.get_soup(index_url)
@@ -121,21 +179,7 @@ def discover_details(client: PoliteClient, source_type: str, start_year: int) ->
     for page in range(count):
         soup = first_soup if page == 0 else client.get_soup(list_page_url(index_url, page))
         page_years: list[int] = []
-        candidates = [
-            (anchor.get_text(" ", strip=True), anchor.get("href", ""))
-            for anchor in soup.select("a[href]")
-        ]
-        # “游戏审批变更信息”的年份链接写在页面脚本字符串中，不会成为实际 DOM 节点。
-        candidates.extend(
-            (title, href)
-            for href, title in re.findall(
-                r'<a\s+href="([^"]+\.html)"[^>]*>\s*([^<]+?)\s*</a>',
-                str(soup),
-                flags=re.IGNORECASE,
-            )
-        )
-        for raw_title, href in candidates:
-            title = clean_company(raw_title)
+        for title, href in listing_candidates(soup):
             match = DETAIL_TITLE_PATTERNS[source_type].search(title)
             if not match:
                 continue
@@ -170,15 +214,22 @@ def parse_approval_page(soup: BeautifulSoup, link: DetailLink) -> list[dict[str,
     records: list[dict[str, Any]] = []
     for row in table.select("tr")[1:]:
         cells = row_cells(row)
-        if len(cells) < 7 or not cells[0].isdigit():
+        if len(cells) < 5 or not cells[0].isdigit():
             continue
 
         # 近年页面表头仍含“申报类别”，但数据行实际省略了该列。
         if len(cells) >= 8:
             _, name, category, publisher, operator, document_number, isbn, approval_date = cells[:8]
-        else:
+        elif len(cells) == 7:
             _, name, publisher, operator, document_number, isbn, approval_date = cells[:7]
             category = "—"
+        elif len(cells) == 5:
+            _, name, publisher, document_number, approval_date = cells
+            category = "进口电子游戏" if "进口电子游戏" in link.title else "—"
+            operator = "—"
+            isbn = "—"
+        else:
+            continue
 
         date = normalize_date(approval_date)
         if not name or not date:
@@ -309,18 +360,31 @@ def write_csv(path: Path, records: list[dict[str, Any]]) -> None:
 
 def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     client = PoliteClient(args.interval)
-    approval_links: list[DetailLink] = []
-    for source_type in ("国产", "进口"):
-        print(f"[发现] 正在读取{source_type}公示目录…", flush=True)
-        links = discover_details(client, source_type, args.start_year)
-        print(f"[发现] {source_type}详情页 {len(links)} 个", flush=True)
-        approval_links.extend(links)
+    print("[发现] 正在读取游戏审批结果总目录…", flush=True)
+    master_approvals, master_changes = discover_all_details(client, args.start_year)
 
-    change_links: list[DetailLink] = []
+    # 总目录保留了 2009 年起的旧记录，但最新月份可能晚于分类目录同步。
+    # 两类目录取并集，避免只抓总目录时漏掉最近发布的批次。
+    approval_map = {link.url: link for link in master_approvals}
+    for source_type in ("国产", "进口"):
+        print(f"[发现] 正在核对{source_type}分类目录…", flush=True)
+        for link in discover_details(client, source_type, args.start_year):
+            approval_map[link.url] = link
+    approval_links = sorted(
+        approval_map.values(), key=lambda item: (item.year, item.url), reverse=True
+    )
+
+    change_map = {link.url: link for link in master_changes}
     if not args.skip_changes:
-        print("[发现] 正在读取审批变更目录…", flush=True)
-        change_links = discover_details(client, "变更", args.start_year)
-        print(f"[发现] 变更详情页 {len(change_links)} 个", flush=True)
+        for link in discover_details(client, "变更", args.start_year):
+            change_map[link.url] = link
+    change_links = [] if args.skip_changes else sorted(
+        change_map.values(), key=lambda item: (item.year, item.url), reverse=True
+    )
+    print(
+        f"[发现] 审批详情页 {len(approval_links)} 个，变更详情页 {len(change_links)} 个",
+        flush=True,
+    )
 
     records: list[dict[str, Any]] = []
     total_pages = len(approval_links)
@@ -360,7 +424,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抓取国家新闻出版署网游审批公示并生成 JSON / CSV")
-    parser.add_argument("--start-year", type=int, default=2014, help="最早抓取年份，默认 2014")
+    parser.add_argument("--start-year", type=int, default=2009, help="最早抓取年份，默认 2009")
     parser.add_argument("--interval", type=float, default=2.2, help="相邻请求最小间隔秒数，默认 2.2")
     parser.add_argument("--output", type=Path, default=Path("public/nppa-games.json"), help="JSON 输出路径")
     parser.add_argument("--csv-output", type=Path, default=Path("data/nppa-games.csv"), help="CSV 输出路径")
@@ -381,7 +445,13 @@ def main() -> int:
         payload = json.loads(args.output.read_text(encoding="utf-8"))
         records = payload.get("records", [])
         client = PoliteClient(args.interval)
-        links = discover_details(client, "变更", args.start_year)
+        _, master_links = discover_all_details(client, args.start_year)
+        link_map = {link.url: link for link in master_links}
+        for link in discover_details(client, "变更", args.start_year):
+            link_map[link.url] = link
+        links = sorted(
+            link_map.values(), key=lambda item: (item.year, item.url), reverse=True
+        )
         print(f"[发现] 变更详情页 {len(links)} 个", flush=True)
         changes: list[dict[str, Any]] = []
         for index, link in enumerate(links, 1):
