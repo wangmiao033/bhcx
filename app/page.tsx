@@ -321,7 +321,7 @@ export default function Home() {
   const latestDate = useMemo(() => records.reduce((latest, record) => {
     const date = record.recordDate ?? record.approvalDate;
     return date > latest ? date : latest;
-  }, '—'), [records]);
+  }, ''), [records]);
   const uniqueNames = useMemo(() => new Set(records.map((record) => normalizeName(record.name))).size, [records]);
 
   useEffect(() => {
