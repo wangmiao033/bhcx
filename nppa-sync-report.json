@@ -1,0 +1,41 @@
+{
+  "oldCount": 29739,
+  "newCount": 30144,
+  "officialTotal": 30144,
+  "added": 405,
+  "approvalPageAdded": 404,
+  "officialRegistryRecovered": 1,
+  "recoveredSample": [
+    {
+      "name": "劲舞团",
+      "documentNumber": "新出音管〔2005〕353号"
+    }
+  ],
+  "enrichedExisting": 0,
+  "yearChangeRows": 97,
+  "affectedDocumentsByChanges": 94,
+  "unmatchedChanges": [],
+  "latest": "2026-10-28",
+  "addedSample": [
+    {
+      "name": "暗夜勇士",
+      "documentNumber": "国新出审〔2026〕2218号"
+    },
+    {
+      "name": "霸主征途",
+      "documentNumber": "国新出审〔2026〕2219号"
+    },
+    {
+      "name": "百变灵兽",
+      "documentNumber": "国新出审〔2026〕2220号"
+    },
+    {
+      "name": "被美食包围了",
+      "documentNumber": "国新出审〔2026〕2221号"
+    },
+    {
+      "name": "边境之歌",
+      "documentNumber": "国新出审〔2026〕2222号"
+    }
+  ]
+}
